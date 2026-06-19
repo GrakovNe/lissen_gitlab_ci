@@ -95,17 +95,14 @@ Release to GitHub:
   script:
     - *assemble_release
 
-    # Определяем версию
     - echo "Reading version from build.gradle.kts..."
     - VERSION=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*versionName = "\(.*\)".*/\1/')
     - echo "Current version -> $VERSION"
 
-    # Находим APK
     - APK_PATH=$(find /build/app -path "*/release/*.apk" ! -name "*unsigned*" | head -n 1)
     - APK_NAME="lissen-${VERSION}.apk"
     - echo "APK path -> $APK_PATH"
 
-    # Получаем предыдущий тег
     - echo "Fetching previous release tag..."
     - |
       PREV_TAG=$(curl -s \
@@ -114,7 +111,6 @@ Release to GitHub:
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))")
       echo "Previous tag -> $PREV_TAG"
 
-    # Собираем release notes из коммитов
     - echo "Generating release notes..."
     - |
       if [ -n "$PREV_TAG" ]; then
@@ -134,7 +130,6 @@ Release to GitHub:
       fi
       echo "Release notes ready"
 
-    # Создаём релиз на GitHub
     - echo "Creating GitHub release $VERSION..."
     - |
       BODY_JSON=$(printf '{"tag_name":"%s","name":"%s","body":"%s","draft":false,"prerelease":false}' \
@@ -155,7 +150,6 @@ Release to GitHub:
       UPLOAD_URL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_url'].replace('{?name,label}',''))")
       echo "Release created, upload URL -> $UPLOAD_URL"
 
-    # Загружаем APK в релиз
     - echo "Uploading APK to release..."
     - |
       FULL_UPLOAD_URL="${UPLOAD_URL}?name=${APK_NAME}&label=${APK_NAME}"
@@ -174,7 +168,6 @@ Release to GitHub:
       fi
       echo "APK uploaded successfully"
 
-    # Поднимаем версию и пушим
     - echo "Bumping version..."
     - |
       NEW_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\.[0-9]*\.\)\([0-9]*\)\(.*\)/echo "\1$((\2+1))\3"/e')
