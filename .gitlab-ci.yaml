@@ -43,11 +43,11 @@ variables:
     - rm -f /tmp/release.keystore
 
 .assemble_release: &assemble_release
-  - echo "Building release APK..."
+  - echo "Building release APK and AAB..."
   - cd /build/app
   - chmod +x ./gradlew
   - |
-    ./gradlew assembleRelease \
+    ./gradlew assembleRelease bundleRelease \
       -Proom.schemaLocation=/build/app/app/schemas \
       -Pandroid.injected.signing.store.file=/tmp/release.keystore \
       -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
@@ -62,11 +62,13 @@ Build APK:
   script:
     - *assemble_release
     - cp app/build/outputs/apk/release/*.apk "$CI_PROJECT_DIR/"
-    - echo "APK saved to artifacts"
+    - cp app/build/outputs/bundle/release/*.aab "$CI_PROJECT_DIR/"
+    - echo "APK and AAB saved to artifacts"
   artifacts:
     name: "lissen-apk-${CI_PIPELINE_ID}"
     paths:
       - "*.apk"
+      - "*.aab"
     expire_in: 30 days
 
 Run Tests:
@@ -95,14 +97,20 @@ Release to GitHub:
   script:
     - *assemble_release
 
+    # Определяем версию
     - echo "Reading version from build.gradle.kts..."
     - VERSION=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*versionName = "\(.*\)".*/\1/')
     - echo "Current version -> $VERSION"
 
-    - APK_PATH=$(find /build/app -path "*/release/*.apk" ! -name "*unsigned*" | head -n 1)
+    # Находим APK и AAB
+    - APK_PATH=$(find /build/app -path "*/apk/release/*.apk" ! -name "*unsigned*" | head -n 1)
+    - AAB_PATH=$(find /build/app -path "*/bundle/release/*.aab" | head -n 1)
     - APK_NAME="lissen-${VERSION}.apk"
+    - AAB_NAME="lissen-${VERSION}.aab"
     - echo "APK path -> $APK_PATH"
+    - echo "AAB path -> $AAB_PATH"
 
+    # Получаем предыдущий тег
     - echo "Fetching previous release tag..."
     - |
       PREV_TAG=$(curl -s \
@@ -111,14 +119,13 @@ Release to GitHub:
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))")
       echo "Previous tag -> $PREV_TAG"
 
+    # Собираем release notes из коммитов
     - echo "Generating release notes..."
     - |
       if [ -n "$PREV_TAG" ]; then
         PREV_SHA=$(git ls-remote https://github.com/$GITHUB_REPO.git "refs/tags/$PREV_TAG" | awk '{print $1}')
         if [ -n "$PREV_SHA" ]; then
-          COMMITS=$(git log --format="- %s" "${PREV_SHA}..HEAD" 2>/dev/null \
-            | head -30 \
-            | sed 's/"/\\"/g')
+          COMMITS=$(git log --format="- %s" "${PREV_SHA}..HEAD" 2>/dev/null | head -30)
         fi
         if [ -z "$COMMITS" ]; then
           COMMITS="- No new commits"
@@ -130,11 +137,11 @@ Release to GitHub:
       fi
       echo "Release notes ready"
 
+    # Создаём релиз на GitHub
     - echo "Creating GitHub release $VERSION..."
     - |
-      BODY_JSON=$(printf '{"tag_name":"%s","name":"%s","body":"%s","draft":false,"prerelease":false}' \
-        "$VERSION" "$VERSION" \
-        "$(echo -e "$RELEASE_NOTES" | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')")
+      ESCAPED_NOTES=$(echo -e "$RELEASE_NOTES" | awk '{gsub(/"/, "\\\""); printf "%s\\n", $0}' | head -c 65000)
+      BODY_JSON="{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"body\":\"${ESCAPED_NOTES}\",\"draft\":false,\"prerelease\":false}"
       RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Content-Type: application/json" \
@@ -150,16 +157,15 @@ Release to GitHub:
       UPLOAD_URL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_url'].replace('{?name,label}',''))")
       echo "Release created, upload URL -> $UPLOAD_URL"
 
+    # Загружаем APK в релиз
     - echo "Uploading APK to release..."
     - |
-      FULL_UPLOAD_URL="${UPLOAD_URL}?name=${APK_NAME}&label=${APK_NAME}"
-      echo "Full upload URL -> $FULL_UPLOAD_URL"
       UPLOAD_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Content-Type: application/vnd.android.package-archive" \
         -H "Accept: application/vnd.github+json" \
         --data-binary @"$APK_PATH" \
-        "$FULL_UPLOAD_URL")
+        "${UPLOAD_URL}?name=${APK_NAME}&label=${APK_NAME}")
       echo "$UPLOAD_RESPONSE"
       UPLOAD_STATUS=$(echo "$UPLOAD_RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
       if [ "$UPLOAD_STATUS" != "201" ]; then
@@ -168,6 +174,24 @@ Release to GitHub:
       fi
       echo "APK uploaded successfully"
 
+    # Загружаем AAB в релиз
+    - echo "Uploading AAB to release..."
+    - |
+      AAB_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        -H "Accept: application/vnd.github+json" \
+        --data-binary @"$AAB_PATH" \
+        "${UPLOAD_URL}?name=${AAB_NAME}&label=${AAB_NAME}")
+      echo "$AAB_RESPONSE"
+      AAB_STATUS=$(echo "$AAB_RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+      if [ "$AAB_STATUS" != "201" ]; then
+        echo "AAB upload failed with status $AAB_STATUS"
+        exit 1
+      fi
+      echo "AAB uploaded successfully"
+
+    # Поднимаем версию и пушим
     - echo "Bumping version..."
     - |
       NEW_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\.[0-9]*\.\)\([0-9]*\)\(.*\)/echo "\1$((\2+1))\3"/e')
@@ -195,4 +219,5 @@ Release to GitHub:
     name: "lissen-release-${CI_PIPELINE_ID}"
     paths:
       - "*.apk"
+      - "*.aab"
     expire_in: 30 days
