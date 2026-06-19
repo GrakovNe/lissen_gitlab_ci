@@ -1,0 +1,205 @@
+stages:
+  - build
+  - test
+  - release
+
+variables:
+  ANDROID_SDK_ROOT: "/opt/android-sdk"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  GITHUB_REPO: "GrakovNe/lissen-android"
+
+.common_setup: &common_setup
+  tags:
+    - android
+  cache:
+    key: android-sdk
+    paths:
+      - /opt/android-sdk/
+  before_script:
+    - sudo apt-get update -qq && sudo apt-get install -y -qq wget unzip git
+    - sudo mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+    - sudo chown -R gitlab-runner:gitlab-runner $ANDROID_SDK_ROOT
+    - sudo mkdir -p /build && sudo chown gitlab-runner:gitlab-runner /build
+    - |
+      if [ ! -f "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+        echo "Installing Android SDK..."
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
+        unzip -q /tmp/cmdtools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
+        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
+        echo "Android SDK installed"
+      else
+        echo "Android SDK already installed, skipping"
+      fi
+    - export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+    - yes | sdkmanager --licenses > /dev/null 2>&1 || true
+    - sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+    - echo "Decoding keystore..."
+    - echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+    - echo "Cloning source repository..."
+    - rm -rf /build/app
+    - git clone https://github.com/GrakovNe/lissen-android.git /build/app
+    - echo "Setup complete"
+  after_script:
+    - rm -f /tmp/release.keystore
+
+.assemble_release: &assemble_release
+  - echo "Building release APK..."
+  - cd /build/app
+  - chmod +x ./gradlew
+  - |
+    ./gradlew assembleRelease \
+      -Proom.schemaLocation=/build/app/app/schemas \
+      -Pandroid.injected.signing.store.file=/tmp/release.keystore \
+      -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+      -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+      -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+  - echo "Build complete"
+
+Build APK:
+  <<: *common_setup
+  stage: build
+  when: manual
+  script:
+    - *assemble_release
+    - cp app/build/outputs/apk/release/*.apk "$CI_PROJECT_DIR/"
+    - echo "APK saved to artifacts"
+  artifacts:
+    name: "lissen-apk-${CI_PIPELINE_ID}"
+    paths:
+      - "*.apk"
+    expire_in: 30 days
+
+Run Tests:
+  <<: *common_setup
+  stage: test
+  needs:
+    - "Build APK"
+  script:
+    - echo "Running unit tests..."
+    - cd /build/app
+    - chmod +x ./gradlew
+    - ./gradlew test -Proom.schemaLocation=/build/app/app/schemas
+    - echo "Tests complete"
+  artifacts:
+    name: "lissen-test-results-${CI_PIPELINE_ID}"
+    when: always
+    paths:
+      - /build/app/app/build/reports/tests/
+    expire_in: 7 days
+
+Release to GitHub:
+  <<: *common_setup
+  stage: release
+  needs:
+    - "Run Tests"
+  script:
+    - *assemble_release
+
+    # Определяем версию
+    - echo "Reading version from build.gradle.kts..."
+    - VERSION=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*versionName = "\(.*\)".*/\1/')
+    - echo "Current version -> $VERSION"
+
+    # Находим APK
+    - APK_PATH=$(find /build/app -path "*/release/*.apk" ! -name "*unsigned*" | head -n 1)
+    - APK_NAME="lissen-${VERSION}.apk"
+    - echo "APK path -> $APK_PATH"
+
+    # Получаем предыдущий тег
+    - echo "Fetching previous release tag..."
+    - |
+      PREV_TAG=$(curl -s \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        https://api.github.com/repos/$GITHUB_REPO/releases/latest \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))")
+      echo "Previous tag -> $PREV_TAG"
+
+    # Собираем release notes из коммитов
+    - echo "Generating release notes..."
+    - |
+      if [ -n "$PREV_TAG" ]; then
+        PREV_SHA=$(git ls-remote https://github.com/$GITHUB_REPO.git "refs/tags/$PREV_TAG" | awk '{print $1}')
+        if [ -n "$PREV_SHA" ]; then
+          COMMITS=$(git log --format="- %s" "${PREV_SHA}..HEAD" 2>/dev/null \
+            | head -30 \
+            | sed 's/"/\\"/g')
+        fi
+        if [ -z "$COMMITS" ]; then
+          COMMITS="- No new commits"
+        fi
+        CHANGELOG_URL="https://github.com/${GITHUB_REPO}/compare/${PREV_TAG}...${VERSION}"
+        RELEASE_NOTES="## Changes since ${PREV_TAG}\n\n${COMMITS}\n\n**Full changelog:** ${CHANGELOG_URL}"
+      else
+        RELEASE_NOTES="Initial release"
+      fi
+      echo "Release notes ready"
+
+    # Создаём релиз на GitHub
+    - echo "Creating GitHub release $VERSION..."
+    - |
+      BODY_JSON=$(printf '{"tag_name":"%s","name":"%s","body":"%s","draft":false,"prerelease":false}' \
+        "$VERSION" "$VERSION" \
+        "$(echo -e "$RELEASE_NOTES" | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')")
+      RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Content-Type: application/json" \
+        https://api.github.com/repos/$GITHUB_REPO/releases \
+        -d "$BODY_JSON")
+      HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+      BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS")
+      echo "$BODY"
+      if [ "$HTTP_STATUS" != "201" ]; then
+        echo "GitHub release creation failed with status $HTTP_STATUS"
+        exit 1
+      fi
+      UPLOAD_URL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_url'].replace('{?name,label}',''))")
+      echo "Release created, upload URL -> $UPLOAD_URL"
+
+    # Загружаем APK в релиз
+    - echo "Uploading APK to release..."
+    - |
+      FULL_UPLOAD_URL="${UPLOAD_URL}?name=${APK_NAME}&label=${APK_NAME}"
+      echo "Full upload URL -> $FULL_UPLOAD_URL"
+      UPLOAD_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Content-Type: application/vnd.android.package-archive" \
+        -H "Accept: application/vnd.github+json" \
+        --data-binary @"$APK_PATH" \
+        "$FULL_UPLOAD_URL")
+      echo "$UPLOAD_RESPONSE"
+      UPLOAD_STATUS=$(echo "$UPLOAD_RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+      if [ "$UPLOAD_STATUS" != "201" ]; then
+        echo "APK upload failed with status $UPLOAD_STATUS"
+        exit 1
+      fi
+      echo "APK uploaded successfully"
+
+    # Поднимаем версию и пушим
+    - echo "Bumping version..."
+    - |
+      NEW_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\.[0-9]*\.\)\([0-9]*\)\(.*\)/echo "\1$((\2+1))\3"/e')
+      echo "New version -> $NEW_VERSION"
+      NEW_MAJOR=$(echo "$NEW_VERSION" | cut -d. -f1)
+      NEW_MINOR=$(echo "$NEW_VERSION" | cut -d. -f2)
+      NEW_PATCH=$(echo "$NEW_VERSION" | cut -d. -f3 | sed 's/-.*//')
+      NEW_VERSION_CODE=$(( NEW_MAJOR * 10000 + NEW_MINOR * 100 + NEW_PATCH ))
+      echo "New versionCode -> $NEW_VERSION_CODE"
+    - |
+      cd /build/app
+      git config user.email "gitlab-ci@local"
+      git config user.name "GitLab CI"
+      sed -i "s/versionName = \"$VERSION\"/versionName = \"$NEW_VERSION\"/" app/build.gradle.kts
+      OLD_VERSION_CODE=$(grep 'versionCode' app/build.gradle.kts | head -1 | sed 's/.*versionCode = \([0-9]*\).*/\1/')
+      sed -i "s/versionCode = $OLD_VERSION_CODE/versionCode = $NEW_VERSION_CODE/" app/build.gradle.kts
+      git add app/build.gradle.kts
+      git commit -m "chore: bump version $VERSION -> $NEW_VERSION (code $OLD_VERSION_CODE -> $NEW_VERSION_CODE)"
+      git push https://GrakovNe:${GITHUB_TOKEN}@github.com/$GITHUB_REPO.git HEAD:main
+      echo "Version bumped to $NEW_VERSION ($NEW_VERSION_CODE) and pushed"
+
+    - echo "All done! Release -> https://github.com/$GITHUB_REPO/releases/tag/$VERSION"
+
+  artifacts:
+    name: "lissen-release-${CI_PIPELINE_ID}"
+    paths:
+      - "*.apk"
+    expire_in: 30 days
