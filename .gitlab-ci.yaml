@@ -1,14 +1,22 @@
 stages:
-  - build
-  - test
+  - fetch
+  - verify
   - release
 
 variables:
   ANDROID_SDK_ROOT: "/opt/android-sdk"
   GRADLE_OPTS: "-Dorg.gradle.daemon=false"
   GITHUB_REPO: "GrakovNe/lissen-android"
+  # The app lives on GitHub; GitLab is hosted elsewhere, so the source is
+  # cloned from GitHub into a per-pipeline path on the (single) shell runner,
+  # so concurrent/later pipelines don't clobber each other's checkout.
+  SOURCE_DIR: "/build/app-${CI_PIPELINE_ID}"
+  SYSTEM_IMAGE: "system-images;android-34;google_apis;x86_64"
 
-.common_setup: &common_setup
+# Shared Android SDK bootstrap. Jobs run as the unprivileged `gitlab-runner`
+# user on a shell runner, so system-level steps need sudo. The image/cmdline
+# tools live under $ANDROID_SDK_ROOT and are cached between pipelines.
+.android_setup: &android_setup
   tags:
     - android
   cache:
@@ -17,96 +25,121 @@ variables:
       - /opt/android-sdk/
   before_script:
     - sudo apt-get update -qq && sudo apt-get install -y -qq wget unzip git
-    - sudo mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
-    - sudo chown -R gitlab-runner:gitlab-runner $ANDROID_SDK_ROOT
-    - sudo mkdir -p /build && sudo chown gitlab-runner:gitlab-runner /build
+    - sudo mkdir -p "$ANDROID_SDK_ROOT" && sudo chown -R gitlab-runner:gitlab-runner "$ANDROID_SDK_ROOT"
+    - mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
     - |
       if [ ! -f "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-        echo "Installing Android SDK..."
         wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
-        unzip -q /tmp/cmdtools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
-        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest
-        echo "Android SDK installed"
-      else
-        echo "Android SDK already installed, skipping"
+        unzip -q /tmp/cmdtools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+        mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
       fi
-    - export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+    - export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/platform-tools:$PATH"
     - yes | sdkmanager --licenses > /dev/null 2>&1 || true
-    - sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" > /dev/null
-    - echo "Decoding keystore..."
-    - echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
-    - echo "Cloning source repository..."
-    - rm -rf /build/app
-    - git clone https://github.com/GrakovNe/lissen-android.git /build/app
-    - echo "Setup complete"
-  after_script:
-    - rm -f /tmp/release.keystore
 
-.assemble_release: &assemble_release
-  - echo "Building release APK and AAB..."
-  - cd /build/app
-  - chmod +x ./gradlew
-  - |
-    ./gradlew assembleRelease bundleRelease \
-      -Proom.schemaLocation=/build/app/app/schemas \
-      -Pandroid.injected.signing.store.file=/tmp/release.keystore \
-      -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
-      -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
-      -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
-  - echo "Build complete"
-
-Build APK:
-  <<: *common_setup
-  stage: build
-  when: manual
+# 1. Fetch the application source from GitHub.
+fetch_source:
+  stage: fetch
+  tags:
+    - android
+  before_script:
+    - sudo apt-get update -qq && sudo apt-get install -y -qq git
+    - sudo mkdir -p /build && sudo chown -R gitlab-runner:gitlab-runner /build
   script:
-    - *assemble_release
-    - cp app/build/outputs/apk/release/*.apk "$CI_PROJECT_DIR/"
-    - cp app/build/outputs/bundle/release/*.aab "$CI_PROJECT_DIR/"
-    - echo "APK and AAB saved to artifacts"
-  artifacts:
-    name: "lissen-apk-${CI_PIPELINE_ID}"
-    paths:
-      - "*.apk"
-      - "*.aab"
-    expire_in: 30 days
+    # Drop checkouts from old pipelines (best-effort housekeeping).
+    - find /build -maxdepth 1 -name 'app-*' -mtime +2 -exec rm -rf {} + 2>/dev/null || true
+    - rm -rf "$SOURCE_DIR"
+    - git clone "https://github.com/${GITHUB_REPO}.git" "$SOURCE_DIR"
+    - echo "Fetched ${GITHUB_REPO} into $SOURCE_DIR"
 
-Run Tests:
-  <<: *common_setup
-  stage: test
+# 2. Build and run both the unit suite and the instrumented suite.
+#    The instrumented suite runs on a headless emulator (KVM passed into the
+#    LXC container from the Proxmox host).
+verify:
+  <<: *android_setup
+  stage: verify
   needs:
-    - "Build APK"
+    - fetch_source
   script:
-    - echo "Running unit tests..."
-    - cd /build/app
+    - sdkmanager "platform-tools" "emulator" "platforms;android-37.0" "build-tools;36.0.0" "$SYSTEM_IMAGE" > /dev/null
+    - cd "$SOURCE_DIR"
     - chmod +x ./gradlew
-    - ./gradlew test -Proom.schemaLocation=/build/app/app/schemas
-    - echo "Tests complete"
+
+    # --- Unit suite ---
+    - echo "Running unit tests..."
+    - ./gradlew test -Proom.schemaLocation=$SOURCE_DIR/app/schemas
+
+    # --- Instrumented suite (headless emulator) ---
+    - echo "no" | avdmanager create avd -n ci_emu -k "$SYSTEM_IMAGE" --device "pixel_6" --force
+    # Redirect the emulator's output to a file; otherwise its background process
+    # keeps the job's stdout pipe open and the job never finishes.
+    - |
+      "$ANDROID_SDK_ROOT/emulator/emulator" -avd ci_emu \
+        -no-window -no-audio -no-boot-anim -no-snapshot \
+        -gpu swiftshader_indirect -accel auto > /tmp/emulator.log 2>&1 &
+    - adb wait-for-device
+    - |
+      echo "Waiting for emulator to finish booting..."
+      timeout 600 sh -c 'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done'
+      adb shell input keyevent 82 || true
+    - adb shell settings put global window_animation_scale 0 || true
+    - adb shell settings put global transition_animation_scale 0 || true
+    - adb shell settings put global animator_duration_scale 0 || true
+    - echo "Running instrumented tests..."
+    - ./gradlew connectedDebugAndroidTest -Proom.schemaLocation=$SOURCE_DIR/app/schemas
+    # Stop the emulator before the script shell exits so the job can finish.
+    - adb emu kill || true
+  after_script:
+    - $ANDROID_SDK_ROOT/platform-tools/adb emu kill || true
+    - mkdir -p "$CI_PROJECT_DIR/test-results" "$CI_PROJECT_DIR/junit"
+    - cp -r $SOURCE_DIR/app/build/reports/tests "$CI_PROJECT_DIR/test-results/unit" 2>/dev/null || true
+    - cp -r $SOURCE_DIR/app/build/reports/androidTests "$CI_PROJECT_DIR/test-results/instrumented" 2>/dev/null || true
+    - cp -r $SOURCE_DIR/app/build/outputs/androidTest-results/connected/* "$CI_PROJECT_DIR/junit/" 2>/dev/null || true
+    - find $SOURCE_DIR/app/build/test-results -name '*.xml' -exec cp {} "$CI_PROJECT_DIR/junit/" \; 2>/dev/null || true
   artifacts:
     name: "lissen-test-results-${CI_PIPELINE_ID}"
     when: always
     paths:
-      - /build/app/app/build/reports/tests/
-    expire_in: 7 days
+      - test-results/
+    reports:
+      junit: junit/**/*.xml
+    expire_in: 14 days
 
-Release to GitHub:
-  <<: *common_setup
+# 3. Manual "Release to GitHub" button. Only becomes available once fetch +
+#    verify have passed. Builds the signed release and publishes it to GitHub.
+release_github:
+  <<: *android_setup
   stage: release
+  when: manual
   needs:
-    - "Run Tests"
+    - verify
   script:
-    - *assemble_release
+    - sudo apt-get install -y -qq curl python3
+    - sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;36.0.0" > /dev/null
+    - echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+    - cd "$SOURCE_DIR"
+    - chmod +x ./gradlew
+
+    - echo "Building release APK and AAB..."
+    - |
+      ./gradlew assembleRelease bundleRelease \
+        -Proom.schemaLocation=$SOURCE_DIR/app/schemas \
+        -Pandroid.injected.signing.store.file=/tmp/release.keystore \
+        -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+        -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+        -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
     - echo "Reading version from build.gradle.kts..."
     - VERSION=$(grep 'versionName' app/build.gradle.kts | head -1 | sed 's/.*versionName = "\(.*\)".*/\1/')
     - echo "Current version -> $VERSION"
 
-    - APK_PATH=$(find /build/app -path "*/apk/release/*.apk" ! -name "*unsigned*" | head -n 1)
-    - AAB_PATH=$(find /build/app -path "*/bundle/release/*.aab" | head -n 1)
+    - APK_PATH=$(find "$SOURCE_DIR" -path "*/apk/release/*.apk" ! -name "*unsigned*" | head -n 1)
+    - AAB_PATH=$(find "$SOURCE_DIR" -path "*/bundle/release/*.aab" | head -n 1)
     - APK_NAME="lissen-${VERSION}.apk"
     - AAB_NAME="lissen-${VERSION}.aab"
-    - echo "APK path -> $APK_PATH"
-    - echo "AAB path -> $AAB_PATH"
+    - cp "$APK_PATH" "$CI_PROJECT_DIR/$APK_NAME"
+    - cp "$AAB_PATH" "$CI_PROJECT_DIR/$AAB_NAME"
+    - echo "APK -> $APK_PATH"
+    - echo "AAB -> $AAB_PATH"
 
     - echo "Fetching previous release tag..."
     - |
@@ -194,7 +227,6 @@ Release to GitHub:
       NEW_VERSION_CODE=$(( NEW_MAJOR * 10000 + NEW_MINOR * 100 + NEW_PATCH ))
       echo "New versionCode -> $NEW_VERSION_CODE"
     - |
-      cd /build/app
       git config user.email "gitlab-ci@local"
       git config user.name "GitLab CI"
       sed -i "s/versionName = \"$VERSION\"/versionName = \"$NEW_VERSION\"/" app/build.gradle.kts
@@ -206,7 +238,8 @@ Release to GitHub:
       echo "Version bumped to $NEW_VERSION ($NEW_VERSION_CODE) and pushed"
 
     - echo "All done! Release -> https://github.com/$GITHUB_REPO/releases/tag/$VERSION"
-
+  after_script:
+    - rm -f /tmp/release.keystore
   artifacts:
     name: "lissen-release-${CI_PIPELINE_ID}"
     paths:
